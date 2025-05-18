@@ -1,176 +1,120 @@
-var pm2 = require('pm2');
+var pm2 = require('/usr/local/lib/node_modules/pm2');
 var os = require('os');
-var request = require('request');
+var https = require('https');
+var url = require('url');
 
-// Version needs to be outside the config file
-var ver = '1.1.0';
+// Plugin version
+var version = '2.0.0';
 
-// Plugin Variables
+
+// Use eithe Env Variables or Config 
+// Environment Variables 
+// var newRelicLicenseKey = process.env.NEW_RELIC_LICENSE_KEY;
+// var pollIntervalMs = process.env.POLL_INTERVAL || 5000;
+// var newRelicMetricApiUrl = 'https://metric-api.newrelic.com/metric/v1';
+
+// Plugin Variables via configs , create a config file seeing template in repo 
 var config = require('./config.json');
-var license = config.nrlicense;
-var guid = config.nrguid;
-var url = config.nrurl;
+var newRelicLicenseKey = config.nrlicense;
+var newRelicMetricApiUrl = config.nrurl;
+var pollIntervalMs = config.pollinterval || 5000; // in milliseconds
 
-// Running restart 
-var restartList = {};
 
-function poll()
-{
-	// Connect or launch pm2
-	pm2.connect(function(err){
+// Track PM2 restart counts
+var restartTracker = {};
 
-		console.log('Just connected to PM2');
+function monitorPm2Processes() {
+  pm2.connect(function (err) {
+    if (err) {
+      console.error('Error connecting to PM2:', err);
+      return;
+    }
 
-		// Pull down the list
-		pm2.list(function(err, list) {
+    pm2.list(function (err, processList) {
+      if (err) {
+        console.error('Error retrieving PM2 process list:', err);
+        return;
+      }
 
-			// Start an output message
-			var msg = {};
+      // Prepare payload for New Relic
+      var payload = [
+        {
+          metrics: [],
+        },
+      ];
 
-			// Create the agent subsection
-			var agent = {};
-			msg.agent = agent;
-			agent.host = os.hostname();
-			agent.pid = process.pid;
-			agent.version = ver;
+      processList.forEach(function (processInfo) {
+        var processMetrics = {
+          name: 'pm2ProcessListProd',
+          type: 'gauge',
+          value: 0,
+          timestamp: Date.now(),
+          attributes: {
+            'host.name': os.hostname(),
+            'process.id': processInfo.pid,
+            restarts: processInfo.pm2_env.restart_time,
+            cpu: processInfo.monit.cpu,
+            memory: processInfo.monit.memory,
+            uptime: calculateProcessUptime(processInfo.pm2_env.pm_uptime),
+            'process.name': processInfo.pm2_env.name,
+          },
+        };
 
-			// Create the components array (with only 1 value)
-			var components = [];
-			msg.components = components;
-			components[0] = {};
-			components[0].name = os.hostname();
-			components[0].guid = guid;
-			components[0].duration = 30;
+        payload[0].metrics.push(processMetrics);
+      });
 
-			// Create the metrics subsection
-			var metrics = {};
-			components[0].metrics = metrics;
+      sendMetricsToNewRelic(payload);
+      pm2.disconnect();
+    });
+  });
 
-			// Process Totals
-			var processArr = {};
-
-			// PM2 Totals
-			var totalUptime = 0;
-			var totalRestarts = 0;
-			var totalCpu = 0;
-			var totalMemory = 0;
-			var totalIntervalRestarts = 0;
-
-			// Pull down data for each function
-			list.forEach(function(proc) {
-
-				// Get the metrics
-				var processPid = proc.pm_id;
-				var processName = proc.pm2_env.name;
-				var processUptime = calcUptime(proc.pm2_env.pm_uptime);
-				var processTotalRestarts = proc.pm2_env.restart_time;
-				var processCpu = proc.monit.cpu;
-				var processMemory = proc.monit.memory;
-
-				// Calculate per interval restarts
-				var processPreviousRestarts = restartList[processName] || 0;
-				var processIntervalRestarts = processTotalRestarts - processPreviousRestarts;
-				restartList[processName] = processTotalRestarts;
-
-				// Store the metrics
-				var namePrefix = 'Component/id/' + processPid + '/' + processName;
-				metrics[namePrefix + '[uptime]'] = processUptime;
-				metrics[namePrefix + '[restarts]'] = processTotalRestarts;
-				metrics[namePrefix + '[cpu]'] = processCpu;
-				metrics[namePrefix + '[memory]'] = processMemory;
-				metrics[namePrefix + '[intervalRestarts]'] = processIntervalRestarts;
-
-				// Increment the Process totals
-				var currentProcess = processArr[processName];
-				if (currentProcess != null) {
-					currentProcess.count++;
-					currentProcess.uptime += processUptime;
-					currentProcess.totalRestarts += processTotalRestarts;
-					currentProcess.cpu += processCpu;
-					currentProcess.memory += processMemory;
-					currentProcess.intervalRestarts += processIntervalRestarts;
-					processArr[processName] = currentProcess;
-				} else {
-					// Initialize the data for this process
-					processArr[processName] = {
-						'count': 1,
-						'uptime': processUptime,
-						'totalRestarts': processTotalRestarts,
-						'cpu': processCpu,
-						'memory': processMemory,
-						'intervalRestarts': processIntervalRestarts
-					}
-				}
-
-				// Increment the PM2 totals
-				totalUptime += processUptime;
-				totalRestarts += processTotalRestarts;
-				totalCpu += processCpu;
-				totalMemory += processMemory;
-				totalIntervalRestarts += processIntervalRestarts;
-			});
-
-			// Create the Process rollup metrics
-			for (var processName in processArr) {
-				var currentProcess = processArr[processName];
-				var namePrefix = 'Component/process/' + processName;
-				metrics[namePrefix + '[count]'] = currentProcess.count;
-				metrics[namePrefix + '[uptime]'] = currentProcess.uptime;
-				metrics[namePrefix + '[restarts]'] = currentProcess.totalRestarts;
-				metrics[namePrefix + '[cpu]'] = currentProcess.cpu;
-				metrics[namePrefix + '[memory]'] = currentProcess.memory;
-				metrics[namePrefix + '[intervalRestarts]'] = currentProcess.intervalRestarts;
-			}
-
-			// Create the PM2 rollup metrics
-			metrics['Component/rollup/all[uptime]'] = totalUptime;
-			metrics['Component/rollup/all[restarts]'] = totalRestarts;
-			metrics['Component/rollup/all[cpu]'] = totalCpu;
-			metrics['Component/rollup/all[memory]'] = totalMemory;
-			metrics['Component/rollup/all[intervalRestarts]'] = totalIntervalRestarts;
-	
-			// console.log(msg.components[0]);
-			postToNewRelic(msg);
-
-			// Disconnect from PM2
-			pm2.disconnect();
-		});
-	});
-
-	// Re-run every 30s
-	setTimeout(poll, 30000)
+  setTimeout(monitorPm2Processes, pollIntervalMs);
 }
 
-function postToNewRelic(msg) {
-	var msgString = JSON.stringify(msg);
-	// console.log(msg.components[0].metrics);
-	request({
-		url: url,
-		method: "POST",
-		headers: {
-			'Content-Type': 'application/json',
-			'Accept': 'application/json',
-			'X-License-Key': license
-		},
-		body: msgString
-	}, function (err, httpResponse, body) {
-		if (!err) {
-			console.log('New Relic Reponse: %d', httpResponse.statusCode);
-			if(body) {
-				console.log('Response from NR: ' + body);
-			}
-		} else {
-			console.log('*** ERROR ***');
-			console.log(err);
-		}
-	});
-	// console.log('Just posted to New Relic: %s', msgString);
+function sendMetricsToNewRelic(metricsPayload) {
+  var metricsPayloadString = JSON.stringify(metricsPayload);
+
+  var parsedUrl = url.parse(newRelicMetricApiUrl);
+  var requestOptions = {
+    hostname: parsedUrl.hostname,
+    port: 443,
+    path: parsedUrl.path,
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      'X-License-Key': newRelicLicenseKey,
+      'Content-Length': Buffer.byteLength(metricsPayloadString),
+    },
+  };
+
+  var request = https.request(requestOptions, (response) => {
+    let responseBody = '';
+
+    response.on('data', (chunk) => {
+      responseBody += chunk;
+    });
+
+    response.on('end', () => {
+      if (responseBody) {
+        //console.log('Response from New Relic:', responseBody);
+      }
+    });
+  });
+
+  request.on('error', (err) => {
+    console.log('*** ERROR while pushing metric to NewRelic *** ', metricsPayloadString);
+    console.error(err);
+  });
+
+  request.write(metricsPayloadString);
+  request.end();
 }
 
-function calcUptime(date) {
-	var seconds = Math.floor((new Date() - date) / 1000);
-	return seconds;
+function calculateProcessUptime(startTime) {
+  return Math.floor((new Date() - startTime) / 1000);
 }
 
-console.log('Starting PM2 Plugin version: ' + ver);
-poll();
+console.log('Starting PM2 Monitoring Plugin version: ' + version);
+monitorPm2Processes();
+
